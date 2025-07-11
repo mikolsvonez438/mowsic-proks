@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>YouTube Proxy Player</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f4f4;
+      padding: 20px;
+      text-align: center;
+    }
+    input[type="text"] {
+      padding: 10px;
+      width: 300px;
+      font-size: 16px;
+    }
+    button {
+      padding: 10px 16px;
+      font-size: 16px;
+      margin-left: 8px;
+    }
+    video {
+      margin-top: 20px;
+      width: 100%;
+      max-width: 720px;
+      border-radius: 12px;
+    }
+    #controls {
+      margin-top: 12px;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+    }
+    li {
+      margin: 5px 0;
+      color: #0073ff;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🎬 YouTube Proxy Player</h1>
+
+  <input type="text" id="searchInput" placeholder="Search YouTube...">
+  <button onclick="searchAndPlay()">Search</button>
+
+  <h2 id="videoTitle">Now Playing</h2>
+  <video id="videoPlayer" controls autoplay></video>
+
+  <div id="controls">
+    <button onclick="playNextVideo()">Next ▶</button>
+    <label>
+      <input type="checkbox" id="autoplayToggle" checked>
+      Autoplay Next (Random)
+    </label>
+  </div>
+
+  <h3>Results</h3>
+  <ul id="searchResults"></ul>
+
+  <script>
+    let searchResults = [];
+    let currentIndex = 0;
+
+    async function searchAndPlay() {
+      const query = document.getElementById("searchInput").value;
+      if (!query) return alert("Enter a search term.");
+
+      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+      searchResults = await res.json();
+      currentIndex = 0;
+      renderResults();
+      playCurrentVideo();
+    }
+
+    function renderResults() {
+      const ul = document.getElementById("searchResults");
+      ul.innerHTML = "";
+      searchResults.forEach((video, index) => {
+        const li = document.createElement("li");
+        li.textContent = video.title;
+        li.onclick = () => {
+          currentIndex = index;
+          playCurrentVideo();
+        };
+        ul.appendChild(li);
+      });
+    }
+
+    async function playCurrentVideo() {
+      const video = searchResults[currentIndex];
+      const url = `https://www.youtube.com/watch?v=${video.id}`;
+      const res = await fetch(`/api/stream_url?url=${encodeURIComponent(url)}`);
+      const data = await res.json();
+
+      if (data.error) return alert("Error: " + data.error);
+
+      const player = document.getElementById("videoPlayer");
+      document.getElementById("videoTitle").innerText = "Now Playing: " + data.title;
+      player.src = `/api/proxy?url=${encodeURIComponent(data.stream_url)}`;
+      player.play();
+    }
+
+    async function playNextVideo() {
+      const currentVideo = searchResults[currentIndex];
+      const originalUrl = `https://www.youtube.com/watch?v=${currentVideo.id}`;
+      try {
+        const res = await fetch(`/api/related?url=${encodeURIComponent(originalUrl)}`);
+        const related = await res.json();
+        if (related.error) throw new Error(related.error);
+
+        // Add to results list so it can be clicked again later
+        searchResults.push(related);
+        currentIndex = searchResults.length - 1;
+        playCurrentVideo();
+
+      } catch (err) {
+        console.warn("Related video not found, fallback to next.");
+        currentIndex++;
+        playCurrentVideo();
+      }
+    }
+
+    document.getElementById("videoPlayer").addEventListener("ended", () => {
+      if (document.getElementById("autoplayToggle").checked) {
+        playNextVideo();
+      }
+    });
+  </script>
+
+</body>
+</html>
