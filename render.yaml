@@ -3,6 +3,9 @@ services:
   - type: web
     name: mowsic-player
     env: python
-    buildCommand: ""
-    startCommand: gunicorn app:app
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --timeout 120 --workers 2"
     plan: free
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "true"
