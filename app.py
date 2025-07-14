@@ -1,12 +1,13 @@
 from flask import Flask, request, jsonify, send_file, Response
 import yt_dlp
 import requests
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 from flask_cors import CORS
 from random import choice
 import os
-import time
+import json
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -14,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+# List of Invidious instances to try as fallbacks
+INVIDIOUS_INSTANCES = [
+    "https://invidious.snopyta.org",
+    "https://yewtu.be",
+    "https://invidious.kavin.rocks",
+    "https://vid.puffyan.us",
+    "https://invidious.namazso.eu",
+    "https://inv.riverside.rocks"
+]
 
 # Configure yt-dlp with more resilient options
 YDL_OPTS_BASE = {
@@ -31,35 +42,111 @@ YDL_OPTS_BASE = {
     }
 }
 
+def get_video_id_from_url(url):
+    """Extract video ID from YouTube URL"""
+    if 'youtube.com/watch?v=' in url:
+        return url.split('youtube.com/watch?v=')[1].split('&')[0]
+    elif 'youtu.be/' in url:
+        return url.split('youtu.be/')[1].split('?')[0]
+    return None
+
+def try_invidious_api(video_id):
+    """Try to get video info from Invidious API"""
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            logger.info(f"Trying Invidious instance: {instance} for video {video_id}")
+            
+            response = requests.get(api_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Find the best audio format
+                formats = data.get('adaptiveFormats', [])
+                if not formats:
+                    continue
+                
+                # Sort by quality (prefer audio)
+                audio_formats = [f for f in formats if f.get('type', '').startswith('audio')]
+                if audio_formats:
+                    best_format = max(audio_formats, key=lambda x: x.get('bitrate', 0))
+                else:
+                    # If no audio formats, get video format
+                    best_format = max(formats, key=lambda x: x.get('bitrate', 0))
+                
+                stream_url = best_format.get('url')
+                if stream_url:
+                    logger.info(f"Successfully got stream URL from Invidious: {instance}")
+                    return {
+                        "stream_url": stream_url,
+                        "title": data.get('title', 'Unknown Title'),
+                        "source": "invidious"
+                    }
+            
+        except Exception as e:
+            logger.error(f"Error with Invidious instance {instance}: {str(e)}")
+            continue
+    
+    return None
+
 @app.route("/api/search")
 def api_search():
     query = request.args.get("q")
     if not query:
         return jsonify({"error": "Missing query"}), 400
     
-    ydl_opts = YDL_OPTS_BASE.copy()
-    ydl_opts.update({
-        'extract_flat': True,
-        'force_generic_extractor': True,
-        'skip_download': True,
-    })
-    
+    # Try direct YouTube search first
     try:
+        ydl_opts = YDL_OPTS_BASE.copy()
+        ydl_opts.update({
+            'extract_flat': True,
+            'force_generic_extractor': True,
+            'skip_download': True,
+        })
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             results = ydl.extract_info(f"ytsearch10:{query}", download=False)
             entries = results.get("entries", [])
             
-            # Filter out None entries (which can happen with errors)
+            # Filter out None entries
             entries = [entry for entry in entries if entry is not None]
             
-            if not entries:
-                logger.warning(f"No results found for query: {query}")
-                return jsonify({"error": "No results found"}), 404
-                
+            if entries:
+                logger.info(f"Found {len(entries)} results for query: {query}")
+                return jsonify(entries)
+    except Exception as e:
+        logger.error(f"YouTube search error: {str(e)}")
+    
+    # Fallback to Invidious search if YouTube fails
+    try:
+        instance = choice(INVIDIOUS_INSTANCES)
+        search_url = f"{instance}/api/v1/search?q={quote(query)}&type=video"
+        logger.info(f"Trying Invidious search: {instance}")
+        
+        response = requests.get(search_url, timeout=10)
+        if response.status_code == 200:
+            invidious_results = response.json()
+            
+            # Convert to format similar to yt-dlp results
+            entries = []
+            for result in invidious_results:
+                entries.append({
+                    "id": result.get("videoId"),
+                    "title": result.get("title"),
+                    "url": f"https://www.youtube.com/watch?v={result.get('videoId')}",
+                    "ie_key": "Youtube",
+                    "duration": result.get("lengthSeconds"),
+                    "view_count": result.get("viewCount"),
+                    "thumbnail": result.get("videoThumbnails", [{}])[0].get("url"),
+                    "_type": "url"
+                })
+            
+            logger.info(f"Found {len(entries)} results from Invidious search")
             return jsonify(entries)
     except Exception as e:
-        logger.error(f"Search error: {str(e)}")
-        return jsonify({"error": f"Search failed: {str(e)}"}), 500
+        logger.error(f"Invidious search error: {str(e)}")
+    
+    return jsonify({"error": "No results found"}), 404
 
 @app.route("/api/stream_url")
 def api_stream_url():
@@ -68,8 +155,12 @@ def api_stream_url():
         return jsonify({"error": "Missing video URL"}), 400
     
     logger.info(f"Fetching stream URL for: {video_url}")
+    video_id = get_video_id_from_url(video_url)
     
-    # Try multiple formats in case one fails
+    if not video_id:
+        return jsonify({"error": "Invalid YouTube URL"}), 400
+    
+    # Try direct YouTube extraction first
     formats_to_try = [
         'bestaudio[ext=m4a]/bestaudio/best[height<=480]/best',
         'bestaudio/best[height<=480]/best',
@@ -98,13 +189,19 @@ def api_stream_url():
                     
                 title = info.get("title", "Untitled")
                 logger.info(f"Successfully extracted stream URL for: {title}")
-                return jsonify({"stream_url": stream_url, "title": title})
+                return jsonify({"stream_url": stream_url, "title": title, "source": "youtube"})
                 
         except Exception as e:
             logger.error(f"Error extracting with format {format_string}: {str(e)}")
-            # Continue to next format
     
-    # If we get here, all formats failed
+    # If YouTube extraction fails, try Invidious
+    logger.info(f"YouTube extraction failed, trying Invidious for video ID: {video_id}")
+    invidious_result = try_invidious_api(video_id)
+    
+    if invidious_result:
+        return jsonify(invidious_result)
+    
+    # If all methods fail
     return jsonify({"error": "Could not extract stream URL. Video may be unavailable or restricted."}), 500
 
 @app.route("/api/proxy")
@@ -132,13 +229,13 @@ def api_proxy():
     def generate():
         try:
             with requests.get(video_url, stream=True, headers=headers, timeout=30) as r:
-                r.raise_for_status()  # Raise an exception for 4XX/5XX responses
+                r.raise_for_status()
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         yield chunk
         except Exception as e:
             logger.error(f"Proxy streaming error: {str(e)}")
-            yield b''  # Return empty to end stream
+            yield b''
     
     return Response(generate(), content_type='video/mp4')
 
@@ -148,38 +245,58 @@ def api_related():
     if not video_url:
         return jsonify({"error": "Missing video URL"}), 400
     
-    ydl_opts = YDL_OPTS_BASE.copy()
-    ydl_opts.update({
-        'extract_flat': False,
-        'skip_download': True,
-    })
+    video_id = get_video_id_from_url(video_url)
+    if not video_id:
+        return jsonify({"error": "Invalid YouTube URL"}), 400
     
+    # Try direct YouTube extraction first
     try:
+        ydl_opts = YDL_OPTS_BASE.copy()
+        ydl_opts.update({
+            'extract_flat': False,
+            'skip_download': True,
+        })
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             
-            if not info:
-                return jsonify({"error": "Could not extract video info"}), 500
+            if info:
+                related = info.get("related_videos", [])
+                candidates = [v for v in related if v.get("id")]
                 
-            related = info.get("related_videos", [])
-            candidates = [v for v in related if v.get("id")]
-            
-            if not candidates:
-                # Try to return at least something
-                return jsonify({
-                    "id": "dQw4w9WgXcQ",  # Fallback video if nothing else works
-                    "title": "Recommended Music"
-                })
-            
-            selected = choice(candidates)
-            return jsonify({
-                "id": selected["id"],
-                "title": selected.get("title", "Untitled")
-            })
-            
+                if candidates:
+                    selected = choice(candidates)
+                    return jsonify({
+                        "id": selected["id"],
+                        "title": selected.get("title", "Untitled")
+                    })
     except Exception as e:
-        logger.error(f"Related videos error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"YouTube related videos error: {str(e)}")
+    
+    # Fallback to Invidious for related videos
+    try:
+        instance = choice(INVIDIOUS_INSTANCES)
+        api_url = f"{instance}/api/v1/videos/{video_id}"
+        
+        response = requests.get(api_url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            recommended = data.get('recommendedVideos', [])
+            
+            if recommended:
+                selected = choice(recommended)
+                return jsonify({
+                    "id": selected.get("videoId"),
+                    "title": selected.get("title", "Untitled")
+                })
+    except Exception as e:
+        logger.error(f"Invidious related videos error: {str(e)}")
+    
+    # Fallback to a popular music video if all else fails
+    return jsonify({
+        "id": "dQw4w9WgXcQ",  # Never Gonna Give You Up
+        "title": "Recommended Music"
+    })
 
 @app.route("/")
 def index():
