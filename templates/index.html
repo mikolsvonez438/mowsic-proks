@@ -39,18 +39,24 @@
       cursor: pointer;
       text-decoration: underline;
     }
+    .status {
+      color: #666;
+      font-style: italic;
+      margin: 10px 0;
+    }
+    .error {
+      color: #ff3333;
+      font-weight: bold;
+    }
   </style>
 </head>
 <body>
-
   <h1>🎬 YouTube Proxy Player</h1>
-
   <input type="text" id="searchInput" placeholder="Search YouTube...">
   <button onclick="searchAndPlay()">Search</button>
-
   <h2 id="videoTitle">Now Playing</h2>
+  <div id="statusMessage" class="status"></div>
   <video id="videoPlayer" controls autoplay></video>
-
   <div id="controls">
     <button onclick="playNextVideo()">Next ▶</button>
     <label>
@@ -58,23 +64,43 @@
       Autoplay Next (Random)
     </label>
   </div>
-
   <h3>Results</h3>
   <ul id="searchResults"></ul>
 
   <script>
     let searchResults = [];
     let currentIndex = 0;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
 
     async function searchAndPlay() {
       const query = document.getElementById("searchInput").value;
       if (!query) return alert("Enter a search term.");
-
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      searchResults = await res.json();
-      currentIndex = 0;
-      renderResults();
-      playCurrentVideo();
+      
+      setStatus("Searching...");
+      
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        
+        if (!res.ok) {
+          throw new Error(`Search failed: ${res.status} ${res.statusText}`);
+        }
+        
+        searchResults = await res.json();
+        
+        if (!searchResults || searchResults.length === 0) {
+          setError("No results found. Try a different search term.");
+          return;
+        }
+        
+        currentIndex = 0;
+        renderResults();
+        playCurrentVideo();
+        
+      } catch (error) {
+        setError(`Search error: ${error.message}`);
+        console.error(error);
+      }
     }
 
     function renderResults() {
@@ -92,37 +118,119 @@
     }
 
     async function playCurrentVideo() {
+      if (currentIndex >= searchResults.length) {
+        setError("No more videos to play");
+        return;
+      }
+      
       const video = searchResults[currentIndex];
       const url = `https://www.youtube.com/watch?v=${video.id}`;
-      const res = await fetch(`/api/stream_url?url=${encodeURIComponent(url)}`);
-      const data = await res.json();
-
-      if (data.error) return alert("Error: " + data.error);
-
-      const player = document.getElementById("videoPlayer");
-      document.getElementById("videoTitle").innerText = "Now Playing: " + data.title;
-      player.src = `/api/proxy?url=${encodeURIComponent(data.stream_url)}`;
-      player.play();
+      
+      setStatus(`Loading video: ${video.title}...`);
+      retryCount = 0;
+      
+      try {
+        const res = await fetch(`/api/stream_url?url=${encodeURIComponent(url)}`);
+        
+        if (!res.ok) {
+          throw new Error(`Failed to get stream URL: ${res.status} ${res.statusText}`);
+        }
+        
+        const data = await res.json();
+        
+        if (data.error) {
+          throw new Error(data.error);
+        }
+        
+        const player = document.getElementById("videoPlayer");
+        document.getElementById("videoTitle").innerText = "Now Playing: " + data.title;
+        
+        // Show source info
+        if (data.source === "invidious") {
+          setStatus("Playing via alternative source (Invidious)");
+        } else {
+          setStatus("Playing via YouTube");
+        }
+        
+        player.src = `/api/proxy?url=${encodeURIComponent(data.stream_url)}`;
+        
+        // Add error handling for video playback
+        player.onerror = function() {
+          handlePlaybackError();
+        };
+        
+        player.play().catch(error => {
+          console.error("Playback error:", error);
+          handlePlaybackError();
+        });
+        
+      } catch (error) {
+        console.error("Error playing video:", error);
+        handlePlaybackError();
+      }
+    }
+    
+    function handlePlaybackError() {
+      if (retryCount < MAX_RETRIES) {
+        retryCount++;
+        setStatus(`Playback failed. Retrying (${retryCount}/${MAX_RETRIES})...`);
+        setTimeout(playCurrentVideo, 1000);
+      } else if (currentIndex + 1 < searchResults.length) {
+        setStatus("Playback failed. Trying next video...");
+        currentIndex++;
+        setTimeout(playCurrentVideo, 1000);
+      } else {
+        setError("Could not play video. Try a different search.");
+      }
     }
 
     async function playNextVideo() {
+      setStatus("Finding next video...");
+      
       const currentVideo = searchResults[currentIndex];
       const originalUrl = `https://www.youtube.com/watch?v=${currentVideo.id}`;
+      
       try {
         const res = await fetch(`/api/related?url=${encodeURIComponent(originalUrl)}`);
+        
+        if (!res.ok) {
+          throw new Error(`Failed to get related video: ${res.status} ${res.statusText}`);
+        }
+        
         const related = await res.json();
-        if (related.error) throw new Error(related.error);
-
+        
+        if (related.error) {
+          throw new Error(related.error);
+        }
+        
         // Add to results list so it can be clicked again later
         searchResults.push(related);
         currentIndex = searchResults.length - 1;
         playCurrentVideo();
-
+        
       } catch (err) {
-        console.warn("Related video not found, fallback to next.");
-        currentIndex++;
-        playCurrentVideo();
+        console.warn("Related video not found, fallback to next in list:", err);
+        
+        // Try next video in the list
+        if (currentIndex + 1 < searchResults.length) {
+          currentIndex++;
+          playCurrentVideo();
+        } else {
+          setError("No more videos available. Try a new search.");
+        }
       }
+    }
+    
+    function setStatus(message) {
+      const statusEl = document.getElementById("statusMessage");
+      statusEl.textContent = message;
+      statusEl.className = "status";
+    }
+    
+    function setError(message) {
+      const statusEl = document.getElementById("statusMessage");
+      statusEl.textContent = message;
+      statusEl.className = "status error";
     }
 
     document.getElementById("videoPlayer").addEventListener("ended", () => {
@@ -130,7 +238,14 @@
         playNextVideo();
       }
     });
+    
+    // Allow pressing Enter in search box
+    document.getElementById("searchInput").addEventListener("keypress", function(event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        searchAndPlay();
+      }
+    });
   </script>
-
 </body>
 </html>
